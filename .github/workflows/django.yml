@@ -1,0 +1,36 @@
+name: Django CI
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    strategy:
+      max-parallel: 4
+      matrix:
+        python-version: [3.12.3]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y python3.12-venv  # Ensure venv module is installed
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Dependencies
+      run: |
+        python3 -m venv venv  # Create virtual environment
+        source venv/bin/activate  # Activate the virtual environment
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Run Tests
+      run: |
+        source venv/bin/activate
+        python manage.py test  # Adjust this command based on your test framework

@@ -1,0 +1,18 @@
+[Unit]
+Description=Video Intelligence SharePoint import worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/actions-runner/_work/Video-Summarizer/Video-Summarizer/backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/actions-runner/_work/Video-Summarizer/Video-Summarizer/backend/venv/bin/python manage.py process_sharepoint_imports --poll-seconds 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
