@@ -8,7 +8,9 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from django.db import transaction
 from django.conf import settings
-from .models import SharePointImport, Video
+from django.utils import timezone
+from .models import SharePointImport, SharePointSyncState, Video
+from .library import copy_analyzed_sharepoint_results
 from .serializers import VideoDetailSerializer, VideoSerializer
 from .services import analyze_transcript, transcribe_video
 from .sharepoint import is_configured
@@ -37,7 +39,13 @@ def openai_failure(error, stage):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def health(request):
-    return Response({'status': 'ok', 'service': 'video-intelligence-api', 'openaiConfigured': bool(settings.OPENAI_API_KEY), 'sharepointConfigured': is_configured(), 'sharepointFolderName': settings.MS_GRAPH_FOLDER_NAME})
+    return Response({
+        'status': 'ok', 'service': 'video-intelligence-api',
+        'openaiConfigured': bool(settings.OPENAI_API_KEY),
+        'sharepointConfigured': is_configured(),
+        'sharepointFolderName': settings.MS_GRAPH_FOLDER_NAME,
+        'sharepointMaxVideoSizeGb': settings.MAX_VIDEO_SIZE_GB,
+    })
 
 
 def sharepoint_import_payload(job):
@@ -45,6 +53,7 @@ def sharepoint_import_payload(job):
         'id': str(job.id), 'folderName': job.folder_name, 'status': job.status,
         'total': job.total, 'folderTotal': job.folder_total, 'processed': job.processed, 'imported': job.imported,
         'failed': job.failed, 'errors': job.errors, 'batchSize': job.batch_size,
+        'trigger': job.trigger,
         'remaining': job.remaining, 'hasMore': job.has_more,
         'createdAt': job.created_at, 'updatedAt': job.updated_at,
     }
@@ -57,6 +66,41 @@ def sharepoint_import_list(request):
     return Response([sharepoint_import_payload(job) for job in jobs])
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def sharepoint_sync_status(request):
+    state = SharePointSyncState.objects.filter(pk=1).first()
+    videos = Video.objects.filter(owner=request.user, source_type='sharepoint')
+    return Response({
+        'lastSuccessfulSync': state.last_success_at if state else None,
+        'lastAttemptAt': state.last_attempt_at if state else None,
+        'nextScheduledSync': state.next_sync_at if state else None,
+        'syncInProgress': bool(state and state.lease_expires_at and state.lease_expires_at > timezone.now()),
+        'discoveredCount': state.discovered_count if state else 0,
+        'awaitingAnalysis': videos.filter(status__in=['pending', 'processing']).count(),
+        'analyzedCount': videos.filter(status='indexed').count(),
+        'failedCount': videos.filter(status='failed').count(),
+        'lastError': state.last_error if state else '',
+        'syncIntervalHours': settings.SHAREPOINT_SYNC_INTERVAL_HOURS,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ScopedRateThrottle])
+@throttle_scope('sharepoint-start')
+def retry_sharepoint_sync(request):
+    if not is_configured():
+        return Response({'detail': 'SharePoint is not configured on the backend.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    state, _ = SharePointSyncState.objects.get_or_create(pk=1)
+    now = timezone.now()
+    if state.lease_expires_at and state.lease_expires_at > now:
+        return Response({'queued': False, 'syncInProgress': True, 'nextScheduledSync': state.next_sync_at})
+    state.next_sync_at = now
+    state.save(update_fields=['next_sync_at', 'updated_at'])
+    return Response({'queued': True, 'syncInProgress': False, 'nextScheduledSync': state.next_sync_at}, status=status.HTTP_202_ACCEPTED)
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @throttle_classes([ScopedRateThrottle])
@@ -64,17 +108,45 @@ def sharepoint_import_list(request):
 def sharepoint_imports(request):
     if not is_configured():
         return Response({'detail': 'SharePoint is not configured. Add the Microsoft Graph settings to the Django backend.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-    active = SharePointImport.objects.filter(owner=request.user, status__in=['queued', 'processing']).first()
+    active = SharePointImport.objects.filter(
+        owner=request.user, status__in=['queued', 'processing', 'cancelling'],
+    ).first()
     if active:
         return Response(sharepoint_import_payload(active), status=status.HTTP_202_ACCEPTED)
     try:
-        batch_size = int(request.data.get('batchSize', 2))
+        batch_size = int(request.data.get('batchSize', settings.SHAREPOINT_BATCH_SIZE))
     except (TypeError, ValueError):
         return Response({'detail': 'Batch size must be a number between 1 and 50.'}, status=status.HTTP_400_BAD_REQUEST)
-    if not 1 <= batch_size <= 50:
-        return Response({'detail': 'Batch size must be between 1 and 50 videos.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not 1 <= batch_size <= 2:
+        return Response({'detail': 'Batch size must be 1 or 2 videos; analysis concurrency is limited to two.'}, status=status.HTTP_400_BAD_REQUEST)
     job = SharePointImport.objects.create(
-        owner=request.user, folder_name=settings.MS_GRAPH_FOLDER_NAME, batch_size=batch_size,
+        owner=request.user, folder_name=settings.MS_GRAPH_FOLDER_NAME, batch_size=batch_size, trigger='manual',
+    )
+    return Response(sharepoint_import_payload(job), status=status.HTTP_202_ACCEPTED)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def retry_sharepoint_video(request, pk):
+    try:
+        video = Video.objects.get(pk=pk, owner=request.user)
+    except Video.DoesNotExist:
+        return Response({'detail': 'Video not found.'}, status=status.HTTP_404_NOT_FOUND)
+    if video.source_type != 'sharepoint':
+        return Response({'detail': 'Only SharePoint videos can be retried through the folder worker.'}, status=status.HTTP_400_BAD_REQUEST)
+    if video.status == 'indexed':
+        return Response({'detail': 'This video is already analyzed. Reanalyze it explicitly instead.'}, status=status.HTTP_409_CONFLICT)
+    active = SharePointImport.objects.filter(
+        owner=request.user, status__in=['queued', 'processing', 'cancelling'],
+    ).first()
+    if active:
+        return Response(sharepoint_import_payload(active), status=status.HTTP_202_ACCEPTED)
+    job = SharePointImport.objects.create(
+        owner=request.user,
+        folder_name=settings.MS_GRAPH_FOLDER_NAME,
+        batch_size=settings.SHAREPOINT_BATCH_SIZE,
+        trigger='manual',
+        target_video=video,
     )
     return Response(sharepoint_import_payload(job), status=status.HTTP_202_ACCEPTED)
 
@@ -125,10 +197,11 @@ class VideoListCreateView(generics.ListCreateAPIView):
     serializer_class = VideoSerializer
 
     def get_queryset(self):
+        copy_analyzed_sharepoint_results(self.request.user)
         return Video.objects.filter(owner=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(owner=self.request.user)
+        serializer.save(owner=self.request.user, analysis_version=settings.VIDEO_ANALYSIS_VERSION)
 
 class VideoDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = VideoDetailSerializer
@@ -165,13 +238,20 @@ def reanalyze(request, pk):
         video = Video.objects.get(pk=pk, owner=request.user)
     except Video.DoesNotExist:
         return Response({'detail': 'Video not found.'}, status=status.HTTP_404_NOT_FOUND)
+    if video.source_type == 'sharepoint' and video.status == 'indexed':
+        return Response(
+            {'detail': 'Successfully analyzed SharePoint videos are not reanalyzed.'},
+            status=status.HTTP_409_CONFLICT,
+        )
     if not video.transcript:
         return Response({'detail': 'This video has no stored transcript to analyze.'}, status=status.HTTP_400_BAD_REQUEST)
     try:
         result = analyze_transcript(video.transcript, video.title)
         for key, field in [('summary', 'summary'), ('categories', 'categories'), ('keyTopics', 'key_topics'), ('kbScore', 'kb_score'), ('trainingReady', 'training_ready'), ('analysisMode', 'analysis_mode')]:
             setattr(video, field, result[key])
+        video.analysis_version = settings.VIDEO_ANALYSIS_VERSION
         video.status = 'indexed'
+        video.analysis_completed_at = timezone.now()
         video.save()
         from .serializers import VideoSerializer
         return Response(VideoSerializer(video).data)
@@ -211,7 +291,9 @@ def upload_video(request):
     try:
         video = Video.objects.create(owner=request.user, title=title, source_url=str(request.data.get('sourceUrl', '')), source_type='upload', transcript=transcript,
             summary=result['summary'], categories=result['categories'], key_topics=result['keyTopics'],
-            kb_score=result['kbScore'], training_ready=result['trainingReady'], status='indexed', analysis_mode=result['analysisMode'])
+            kb_score=result['kbScore'], training_ready=result['trainingReady'], status='indexed',
+            analysis_mode=result['analysisMode'], analysis_version=settings.VIDEO_ANALYSIS_VERSION,
+            analysis_completed_at=timezone.now())
         from .serializers import VideoSerializer
         return Response(VideoSerializer(video).data, status=status.HTTP_201_CREATED)
     except RuntimeError as error:

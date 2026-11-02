@@ -34,6 +34,8 @@ class LoginSerializer(serializers.Serializer):
 class VideoSerializer(serializers.ModelSerializer):
     sourceUrl = serializers.URLField(source='source_url', required=False, allow_blank=True)
     sourceType = serializers.CharField(source='source_type', required=False)
+    sourceFolder = serializers.CharField(source='source_folder', read_only=True)
+    analysisCompletedAt = serializers.DateTimeField(source='analysis_completed_at', read_only=True)
     keyTopics = serializers.ListField(source='key_topics', child=serializers.CharField(), required=False)
     kbScore = serializers.IntegerField(source='kb_score', required=False, min_value=0, max_value=100)
     trainingReady = serializers.BooleanField(source='training_ready', required=False)
@@ -44,7 +46,7 @@ class VideoSerializer(serializers.ModelSerializer):
     transcript = serializers.CharField(write_only=True, required=False, allow_blank=True)
     class Meta:
         model = Video
-        fields = ['id', 'title', 'sourceUrl', 'sourceType', 'summary', 'transcript', 'categories', 'keyTopics', 'duration', 'language', 'kbScore', 'trainingReady', 'status', 'errorMessage', 'analysisMode', 'createdAt', 'updatedAt']
+        fields = ['id', 'title', 'sourceUrl', 'sourceType', 'sourceFolder', 'summary', 'transcript', 'categories', 'keyTopics', 'duration', 'language', 'kbScore', 'trainingReady', 'status', 'errorMessage', 'analysisMode', 'analysisCompletedAt', 'createdAt', 'updatedAt']
 
 
 class VideoDetailSerializer(VideoSerializer):

@@ -22,7 +22,7 @@ ROOT_URLCONF = 'config.urls'
 TEMPLATES = [{'BACKEND': 'django.template.backends.django.DjangoTemplates', 'DIRS': [], 'APP_DIRS': True,
               'OPTIONS': {'context_processors': ['django.template.context_processors.request', 'django.contrib.auth.context_processors.auth', 'django.contrib.messages.context_processors.messages']}}]
 WSGI_APPLICATION = 'config.wsgi.application'
-DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3'}}
+DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': os.getenv('DJANGO_DB_PATH') or BASE_DIR / 'db.sqlite3'}}
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator', 'OPTIONS': {'min_length': 12}},
@@ -35,7 +35,17 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://3.108.234.6').split(',') if origin.strip()]
+_configured_cors_origins = [
+    origin.strip()
+    for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://3.108.234.6').split(',')
+    if origin.strip()
+]
+_local_vite_origins = [
+    f'http://{host}:{port}'
+    for host in ('localhost', '127.0.0.1')
+    for port in (5173, 5174, 5175)
+]
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys(_configured_cors_origins + _local_vite_origins))
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': ['rest_framework.renderers.JSONRenderer'],
     'DEFAULT_AUTHENTICATION_CLASSES': ['rest_framework.authentication.TokenAuthentication'],
@@ -54,3 +64,10 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 550 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 MAX_VIDEO_SIZE_GB = max(1, int(os.getenv('MAX_VIDEO_SIZE_GB', '5')))
 MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_GB * 1024 * 1024 * 1024
+SHAREPOINT_BATCH_SIZE = min(2, max(1, int(os.getenv('SHAREPOINT_BATCH_SIZE', '2'))))
+SHAREPOINT_MAX_VIDEO_RETRIES = max(0, int(os.getenv('SHAREPOINT_MAX_VIDEO_RETRIES', '2')))
+SHAREPOINT_RETRY_DELAY_SECONDS = max(0, int(os.getenv('SHAREPOINT_RETRY_DELAY_SECONDS', '30')))
+SHAREPOINT_SYNC_MAX_RETRIES = max(0, int(os.getenv('SHAREPOINT_SYNC_MAX_RETRIES', '3')))
+SHAREPOINT_SYNC_RETRY_DELAY_SECONDS = max(1, int(os.getenv('SHAREPOINT_SYNC_RETRY_DELAY_SECONDS', '900')))
+SHAREPOINT_SYNC_INTERVAL_HOURS = max(1, int(os.getenv('SHAREPOINT_SYNC_INTERVAL_HOURS', '24')))
+VIDEO_ANALYSIS_VERSION = '1'

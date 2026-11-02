@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the SharePoint video discovery once every day
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=24h
+Unit=video-sharepoint-sync.service
+
+[Install]
+WantedBy=timers.target

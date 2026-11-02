@@ -3,6 +3,7 @@ import os
 import random
 import tempfile
 import time
+from django.utils.dateparse import parse_datetime
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlparse
@@ -17,8 +18,43 @@ GRAPH_RETRY_STATUSES = {429, 500, 502, 503, 504}
 GRAPH_MAX_RETRIES = 5
 
 
+def item_version(item):
+    """Return stable file version fields supplied by Graph, when available."""
+    try:
+        size = int(item.get('size')) if item.get('size') is not None else None
+    except (TypeError, ValueError):
+        size = None
+    return {
+        'source_size': size,
+        'source_etag': str(item.get('eTag') or '')[:255],
+        'source_ctag': str(item.get('cTag') or '')[:255],
+        'source_modified_at': parse_datetime(str(item.get('lastModifiedDateTime') or '')),
+    }
+
+
+def source_version_changed(video, item):
+    """Compare content-version metadata, falling back to size/modified time."""
+    version = item_version(item)
+    if version['source_ctag'] and video.source_ctag:
+        return version['source_ctag'] != video.source_ctag
+    if version['source_etag'] and video.source_etag:
+        return version['source_etag'] != video.source_etag
+    if version['source_size'] is not None and video.source_size is not None:
+        if version['source_size'] != video.source_size:
+            return True
+    modified = version['source_modified_at']
+    if modified and video.source_modified_at:
+        if modified > video.source_modified_at:
+            return True
+    return False
+
+
 class SharePointError(Exception):
     """A safe-to-display SharePoint integration error."""
+
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def is_configured():
@@ -48,14 +84,17 @@ class GraphClient:
                 'grant_type': 'client_credentials',
             })
             if response.status_code != 200:
-                raise SharePointError('Microsoft sign-in failed. Check the tenant, app ID, and rotated app credential in backend configuration.')
+                raise SharePointError(
+                    'Microsoft sign-in failed. Check the tenant, app ID, and rotated app credential in backend configuration.',
+                    retryable=response.status_code == 408 or response.status_code == 429 or response.status_code >= 500,
+                )
             body = response.json()
             self.token = body.get('access_token')
             if not self.token:
                 raise SharePointError('Microsoft sign-in did not return an access token.')
             self.token_expires_at = time.monotonic() + int(body.get('expires_in', 3600)) - 60
         except httpx.HTTPError as error:
-            raise SharePointError('Could not connect to Microsoft sign-in. Check backend network access.') from error
+            raise SharePointError('Could not connect to Microsoft sign-in. Check backend network access.', retryable=True) from error
 
     @property
     def headers(self):
@@ -98,14 +137,14 @@ class GraphClient:
 
     def children(self, folder_id):
         path = f'{GRAPH_ROOT}/drives/{quote(self.drive_id, safe="")}/items/{quote(folder_id, safe="")}/children'
-        next_url = path + '?$select=id,name,size,file,folder,webUrl,lastModifiedDateTime&$top=200'
+        next_url = path + '?$select=id,name,size,file,folder,webUrl,lastModifiedDateTime,eTag,cTag&$top=200'
         while next_url:
             if urlparse(next_url).scheme != 'https' or urlparse(next_url).hostname != 'graph.microsoft.com':
                 raise SharePointError('Microsoft Graph returned an unexpected paging URL.')
             try:
                 response = self._get_graph(next_url)
             except httpx.HTTPError as error:
-                raise SharePointError('Could not list files in the configured SharePoint folder.') from error
+                raise SharePointError('Could not list files in the configured SharePoint folder.', retryable=True) from error
             if response.status_code != 200:
                 if response.status_code == 401:
                     raise SharePointError('Microsoft Graph rejected the access token. Check the tenant ID, client ID, and client secret.')
@@ -114,8 +153,11 @@ class GraphClient:
                 if response.status_code == 404:
                     raise SharePointError('Microsoft Graph could not find the configured drive or folder. Verify MS_GRAPH_DRIVE_ID and MS_GRAPH_FOLDER_ITEM_ID.')
                 if response.status_code == 429:
-                    raise SharePointError('Microsoft Graph is still throttling folder access after several retries. Wait a few minutes and try again.')
-                raise SharePointError(f'Microsoft Graph could not list the folder (HTTP {response.status_code}).')
+                    raise SharePointError('Microsoft Graph is still throttling folder access after several retries. Wait a few minutes and try again.', retryable=True)
+                raise SharePointError(
+                    f'Microsoft Graph could not list the folder (HTTP {response.status_code}).',
+                    retryable=response.status_code == 408 or response.status_code >= 500,
+                )
             try:
                 body = response.json()
             except ValueError as error:
@@ -127,21 +169,30 @@ class GraphClient:
 
     def list_videos(self):
         videos = []
-        pending_folders = [self.folder_id]
+        root_name = str(settings.MS_GRAPH_FOLDER_NAME or 'SharePoint folder').strip('/')
+        pending_folders = [(self.folder_id, root_name)]
         visited = set()
         while pending_folders:
-            folder_id = pending_folders.pop()
+            folder_id, folder_path = pending_folders.pop()
             if folder_id in visited:
                 continue
             visited.add(folder_id)
             for item in self.children(folder_id):
                 if item.get('folder') is not None:
-                    pending_folders.append(item['id'])
+                    child_name = str(item.get('name') or '').strip('/')
+                    pending_folders.append((item['id'], f'{folder_path}/{child_name}' if child_name else folder_path))
                     continue
                 ext = os.path.splitext(item.get('name', ''))[1].lower()
                 if item.get('file') is not None and ext in VIDEO_EXTENSIONS:
+                    item['sourceFolder'] = folder_path
+                    item['driveId'] = self.drive_id
                     videos.append(item)
-        return videos
+        # Defensive dedupe in case Graph returns a repeated item across pages.
+        unique = {}
+        for item in videos:
+            key = (str(item.get('driveId') or self.drive_id), str(item.get('id') or item.get('webUrl') or ''))
+            unique.setdefault(key, item)
+        return list(unique.values())
 
     def download(self, item, destination):
         item_id = quote(item['id'], safe='')
@@ -150,20 +201,26 @@ class GraphClient:
         try:
             response = self._get_graph(url)
         except httpx.HTTPError as error:
-            raise SharePointError('Could not request the video from SharePoint.') from error
+            raise SharePointError('Could not request the video from SharePoint.', retryable=True) from error
         if response.status_code not in (301, 302, 303, 307, 308) or not response.headers.get('location'):
             if response.status_code == 403:
                 raise SharePointError('Microsoft Graph denied access to this video. Check the app folder permission.')
             if response.status_code == 429:
-                raise SharePointError('Microsoft Graph is still throttling video access after several retries. Wait a few minutes and try again.')
-            raise SharePointError(f'Microsoft Graph could not open the video (HTTP {response.status_code}).')
+                raise SharePointError('Microsoft Graph is still throttling video access after several retries. Wait a few minutes and try again.', retryable=True)
+            raise SharePointError(
+                f'Microsoft Graph could not open the video (HTTP {response.status_code}).',
+                retryable=response.status_code == 408 or response.status_code >= 500,
+            )
 
         # Graph returns a short-lived preauthorized download URL. Request it without
         # the Graph bearer token and never persist or log the signed URL.
         try:
             with self.http.stream('GET', response.headers['location']) as download:
                 if download.status_code != 200:
-                    raise SharePointError(f'SharePoint video download failed (HTTP {download.status_code}).')
+                    raise SharePointError(
+                        f'SharePoint video download failed (HTTP {download.status_code}).',
+                        retryable=download.status_code == 408 or download.status_code == 429 or download.status_code >= 500,
+                    )
                 length = int(download.headers.get('content-length', 0) or 0)
                 if length > MAX_VIDEO_BYTES:
                     raise SharePointError(f'Video exceeds the {settings.MAX_VIDEO_SIZE_GB} GB processing limit.')
@@ -174,7 +231,7 @@ class GraphClient:
                         raise SharePointError(f'Video exceeds the {settings.MAX_VIDEO_SIZE_GB} GB processing limit.')
                     destination.write(chunk)
         except httpx.HTTPError as error:
-            raise SharePointError('Could not download the video from SharePoint.') from error
+            raise SharePointError('Could not download the video from SharePoint.', retryable=True) from error
         if not written:
             raise SharePointError('The SharePoint video file was empty.')
 

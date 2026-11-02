@@ -11,6 +11,14 @@ class Video(models.Model):
     title = models.CharField(max_length=300)
     source_url = models.URLField(blank=True)
     source_type = models.CharField(max_length=20, default='transcript')
+    source_folder = models.CharField(max_length=500, blank=True)
+    source_drive_id = models.CharField(max_length=255, blank=True)
+    source_item_id = models.CharField(max_length=255, blank=True)
+    source_modified_at = models.DateTimeField(null=True, blank=True)
+    source_size = models.PositiveBigIntegerField(null=True, blank=True)
+    source_etag = models.CharField(max_length=255, blank=True)
+    source_ctag = models.CharField(max_length=255, blank=True)
+    analysis_version = models.CharField(max_length=32, default='1')
     summary = models.TextField(blank=True)
     transcript = models.TextField(blank=True)
     categories = models.JSONField(default=list)
@@ -21,12 +29,21 @@ class Video(models.Model):
     training_ready = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUSES, default='pending')
     error_message = models.CharField(max_length=500, blank=True)
+    retry_count = models.PositiveSmallIntegerField(default=0)
+    analysis_completed_at = models.DateTimeField(null=True, blank=True)
     analysis_mode = models.CharField(max_length=20, choices=MODES, default='manual')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['owner', 'source_drive_id', 'source_item_id'],
+                condition=models.Q(source_type='sharepoint') & ~models.Q(source_drive_id='') & ~models.Q(source_item_id=''),
+                name='unique_sharepoint_video_per_owner',
+            ),
+        ]
 
 
 class SharePointImport(models.Model):
@@ -41,7 +58,9 @@ class SharePointImport(models.Model):
     processed = models.PositiveIntegerField(default=0)
     imported = models.PositiveIntegerField(default=0)
     failed = models.PositiveIntegerField(default=0)
-    batch_size = models.PositiveSmallIntegerField(default=10)
+    batch_size = models.PositiveSmallIntegerField(default=2)
+    trigger = models.CharField(max_length=20, choices=[('manual', 'Manual'), ('scheduled', 'Scheduled')], default='manual')
+    target_video = models.ForeignKey(Video, null=True, blank=True, related_name='retry_imports', on_delete=models.SET_NULL)
     remaining = models.PositiveIntegerField(default=0)
     has_more = models.BooleanField(default=True)
     errors = models.JSONField(default=list, blank=True)
@@ -51,3 +70,19 @@ class SharePointImport(models.Model):
     class Meta:
         ordering = ['-created_at']
 
+
+class SharePointSyncState(models.Model):
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    last_success_at = models.DateTimeField(null=True, blank=True)
+    next_sync_at = models.DateTimeField(null=True, blank=True)
+    discovered_count = models.PositiveIntegerField(default=0)
+    last_error = models.CharField(max_length=500, blank=True)
+    lease_token = models.UUIDField(null=True, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class SharePointAnalysisSlot(models.Model):
+    slot_number = models.PositiveSmallIntegerField(primary_key=True)
+    lease_token = models.UUIDField(null=True, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
