@@ -40,12 +40,12 @@ _configured_cors_origins = [
     for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://3.108.234.6').split(',')
     if origin.strip()
 ]
-_local_vite_origins = [
+_additional_cors_origins = [
     f'http://{host}:{port}'
     for host in ('localhost', '127.0.0.1')
     for port in (5173, 5174, 5175)
-]
-CORS_ALLOWED_ORIGINS = list(dict.fromkeys(_configured_cors_origins + _local_vite_origins))
+] + ['https://vsfrontend.vestaging.in']
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys(_configured_cors_origins + _additional_cors_origins))
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': ['rest_framework.renderers.JSONRenderer'],
     'DEFAULT_AUTHENTICATION_CLASSES': ['rest_framework.authentication.TokenAuthentication'],
